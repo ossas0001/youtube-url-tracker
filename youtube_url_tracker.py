@@ -44,6 +44,8 @@ TYPE_NAMES = {
     "streams": "直播",
 }
 
+MAX_URL_COUNT = 500
+
 YOUTUBE_HOSTS = {
     "youtube.com",
     "www.youtube.com",
@@ -66,6 +68,13 @@ def normalize_content_type(value: str) -> str:
 
 def normalize_name(value: str) -> str:
     return re.sub(r"\s+", "", value).lstrip("@").casefold()
+
+
+def validate_count(count: int | None) -> int:
+    """驗證使用者要求的網址數量，避免意外進行過大的抓取。"""
+    if count is None or count < 1 or count > MAX_URL_COUNT:
+        raise TrackerError(f"網址數量必須是 1 到 {MAX_URL_COUNT} 的整數。")
+    return count
 
 
 def channel_base_from_input(channel: str) -> str | None:
@@ -141,7 +150,10 @@ def resolve_channel(channel: str) -> tuple[str, str]:
     for url, name in candidates:
         if normalize_name(name) == wanted:
             return url, name
-    return candidates[0]
+    raise TrackerError(
+        f"搜尋到「{query}」的候選頻道，但沒有名稱完全相同的結果；"
+        "為避免選錯頻道，請改輸入 @handle 或完整頻道網址。"
+    )
 
 
 def video_id_from_entry(entry: dict[str, Any]) -> str | None:
@@ -179,6 +191,10 @@ def collect_urls(channel_url: str, content_type: str, count: int) -> list[str]:
             urls.append(f"https://www.youtube.com/watch?v={video_id}")
         if len(urls) >= count:
             break
+    if not urls:
+        raise TrackerError(
+            f"頻道的「{TYPE_NAMES[content_type]}」分頁沒有可用網址，未建立輸出檔案。"
+        )
     return urls
 
 
@@ -192,7 +208,15 @@ def output_path_from_name(filename: str) -> Path:
     return path
 
 
-def write_urls(path: Path, urls: list[str]) -> None:
+def write_urls(path: Path, urls: list[str], *, overwrite: bool = False) -> None:
+    """寫入網址；除非明確允許，絕不覆寫既有檔案。"""
+    if path.exists():
+        if path.is_dir():
+            raise TrackerError(f"輸出位置是資料夾，不能寫入檔案：{path}")
+        if not overwrite:
+            raise TrackerError(
+                f"輸出檔案已存在：{path}。請改用其他檔名，或使用 --overwrite 明確覆寫。"
+            )
     path.parent.mkdir(parents=True, exist_ok=True)
     content = "\n".join(urls)
     if content:
@@ -204,12 +228,21 @@ def ask_positive_integer(prompt: str) -> int:
     while True:
         value = input(prompt).strip()
         try:
-            number = int(value)
-            if number > 0:
-                return number
-        except ValueError:
+            return validate_count(int(value))
+        except (ValueError, TrackerError):
             pass
-        print("請輸入大於 0 的整數。")
+        print(f"請輸入 1 到 {MAX_URL_COUNT} 的整數。")
+
+
+def confirm_overwrite(path: Path) -> bool:
+    """在互動模式中確認是否覆寫現有檔案。"""
+    while True:
+        answer = input(f"檔案已存在：{path}，要覆寫嗎？ [y/N]：").strip().casefold()
+        if answer in {"y", "yes", "是", "確認"}:
+            return True
+        if answer in {"", "n", "no", "否"}:
+            return False
+        print("請輸入 y 或 n。")
 
 
 def interactive_inputs() -> tuple[str, str, int, str]:
@@ -230,6 +263,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--type", dest="content_type", help="shorts、videos 或 live")
     parser.add_argument("--count", type=int, help="要輸出的網址數量")
     parser.add_argument("--output", help="輸出 TXT 檔名")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="明確允許覆寫已存在的輸出檔案",
+    )
     return parser
 
 
@@ -240,7 +278,8 @@ def main() -> int:
 
     args = build_parser().parse_args()
     provided = [args.channel, args.content_type, args.count, args.output]
-    if any(value is not None for value in provided):
+    command_line_mode = args.overwrite or any(value is not None for value in provided)
+    if command_line_mode:
         if not all(value is not None for value in provided):
             print("錯誤：命令列模式必須同時提供 --channel、--type、--count、--output。", file=sys.stderr)
             return 2
@@ -255,16 +294,24 @@ def main() -> int:
 
     try:
         content_type = normalize_content_type(str(raw_type))
-        if count is None or count <= 0:
-            raise TrackerError("網址數量必須是大於 0 的整數。")
+        count = validate_count(count)
         output_path = output_path_from_name(str(filename))
+        overwrite = args.overwrite
+        if output_path.exists() and not command_line_mode:
+            overwrite = confirm_overwrite(output_path)
+        if output_path.exists() and not overwrite:
+            raise TrackerError(
+                f"輸出檔案已存在：{output_path}。請改用其他檔名，或使用 --overwrite 明確覆寫。"
+            )
 
         print("正在尋找頻道……")
         channel_url, channel_name = resolve_channel(str(channel))
         print(f"已找到：{channel_name}（{channel_url}）")
         print(f"正在讀取{TYPE_NAMES[content_type]}網址……")
         urls = collect_urls(channel_url, content_type, count)
-        write_urls(output_path, urls)
+        if not urls:
+            raise TrackerError("沒有取得可用網址，未建立輸出檔案。")
+        write_urls(output_path, urls, overwrite=overwrite)
     except TrackerError as exc:
         print(f"錯誤：{exc}", file=sys.stderr)
         return 1
